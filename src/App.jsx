@@ -787,10 +787,29 @@ function AuthPage({ onLogin }) {
         setMessage({ type:"error", text: error.error_description || error.message || "Sign in failed." });
       } else {
         const token = data.access_token;
-        // Look up by auth_id (the new column), fallback to id for existing users
+        // Look up by auth_id first, then fall back to id (for pre-migration users)
+        let profile = null;
         const { data: byAuthId } = await db.getProfileByAuthId(data.user.id, token);
-        const profile = byAuthId?.[0] || null;
-        onLogin({ ...data.user, profile: profile || {}, token });
+        if (byAuthId?.[0]) {
+          profile = byAuthId[0];
+        } else {
+          // Fallback: pre-migration users have id === auth id
+          const { data: byId } = await db.getProfile(data.user.id, token);
+          profile = byId?.[0] || null;
+          // If found via fallback, backfill auth_id silently
+          if (profile) {
+            await sbFetch(`/rest/v1/profiles?id=eq.${profile.id}`, {
+              method: "PATCH",
+              headers: { Prefer: "return=representation" },
+              body: JSON.stringify({ auth_id: data.user.id }),
+            }, token);
+          }
+        }
+        if (!profile) {
+          setMessage({ type:"error", text:"Could not load your profile. Please try again." });
+          setLoading(false); return;
+        }
+        onLogin({ ...data.user, profile, token });
       }
     } else {
       if (!fullName) { setMessage({ type:"error", text:"Please enter your name." }); setLoading(false); return; }
@@ -932,14 +951,24 @@ function CreateCircle({ user, onBack, onCreated }) {
 
   const handle = async () => {
     if (!name.trim()) { setMessage({ type:"error", text:"Please give your circle a name." }); return; }
+    if (!user?.profile?.id) {
+      setMessage({ type:"error", text:"Session error — please sign out and sign back in." });
+      return;
+    }
     setLoading(true); setMessage(null);
     const { data: circles, error } = await db.createCircle(name.trim(), desc.trim(), user.profile.id, user.token);
     if (error || !circles?.length) {
-      setMessage({ type:"error", text:"Could not create circle. Please try again." });
+      const detail = error?.message || error?.details || error?.hint || JSON.stringify(error);
+      setMessage({ type:"error", text:`Could not create circle: ${detail}` });
       setLoading(false); return;
     }
     const circle = circles[0];
-    await db.addMember(circle.id, user.profile.id, "admin", "approved", "family", user.token);
+    const { error: memberErr } = await db.addMember(circle.id, user.profile.id, "admin", "approved", "family", user.token);
+    if (memberErr) {
+      const detail = memberErr?.message || memberErr?.details || JSON.stringify(memberErr);
+      setMessage({ type:"error", text:`Circle created but could not add you as admin: ${detail}` });
+      setLoading(false); return;
+    }
     onCreated(circle);
   };
 
