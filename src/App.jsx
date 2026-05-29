@@ -3,21 +3,19 @@ import { useState, useEffect, useCallback } from "react";
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
-// TEMPORARY DEBUG — remove after confirming env vars are set
-console.log("SUPABASE_URL:", SUPABASE_URL);
-console.log("SUPABASE_ANON_KEY:", SUPABASE_ANON_KEY ? "SET ✓" : "MISSING ✗");
 
 // ─── Supabase helpers ─────────────────────────────────────────────────────────
 
 async function sbFetch(endpoint, options = {}, token = null) {
+  const { headers: extraHeaders, ...restOptions } = options;
   const res = await fetch(`${SUPABASE_URL}${endpoint}`, {
+    ...restOptions,
     headers: {
       "Content-Type": "application/json",
       apikey: SUPABASE_ANON_KEY,
       Authorization: `Bearer ${token || SUPABASE_ANON_KEY}`,
-      ...(options.headers || {}),
+      ...(extraHeaders || {}),
     },
-    ...options,
   });
   const text = await res.text();
   let data = null;
