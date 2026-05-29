@@ -75,8 +75,9 @@ const db = {
 
   // ── Events ──
   getCircleEvents: (circleId, weekStart, weekEnd, token) =>
+    // Fetch events that overlap this week OR are recurring (started before week end)
     sbFetch(
-      `/rest/v1/events?circle_id=eq.${circleId}&start_time=lte.${weekEnd}&end_time=gte.${weekStart}&select=*,event_members(profile_id)&order=start_time.asc`,
+      `/rest/v1/events?circle_id=eq.${circleId}&or=(and(start_time.lte.${weekEnd},end_time.gte.${weekStart}),recurring.eq.true)&select=*,event_members(profile_id)&order=start_time.asc`,
       { method: "GET" }, token
     ),
   createEvent: (payload, token) =>
@@ -194,6 +195,41 @@ function eventOverlapsDay(event, day) {
 
 function eventStartsOnDay(event, day) {
   return isSameDay(new Date(event.start_time), day);
+}
+
+// Returns true if a recurring event should appear on a given day
+function recurringOccursOnDay(event, day) {
+  if (!event.recurring) return false;
+  const origin = new Date(event.start_time);
+  // Must be same day-of-week
+  if (origin.getDay() !== day.getDay()) return false;
+  // Day must be on or after the original start date
+  const dayMidnight = new Date(day); dayMidnight.setHours(0,0,0,0);
+  const originMidnight = new Date(origin); originMidnight.setHours(0,0,0,0);
+  if (dayMidnight < originMidnight) return false;
+  // Must be before recurring_end (if set)
+  if (event.recurring_end) {
+    const endDate = new Date(event.recurring_end + "T23:59:59");
+    if (day > endDate) return false;
+  }
+  return true;
+}
+
+// Returns true if an event (recurring or not) should appear on a given day
+function eventAppearsOnDay(event, day) {
+  if (event.recurring) return recurringOccursOnDay(event, day);
+  return eventOverlapsDay(event, day);
+}
+
+// For a recurring event projected onto a specific day, build display-time strings
+function projectedTimes(event, day) {
+  const origin = new Date(event.start_time);
+  const originEnd = new Date(event.end_time);
+  const durationMs = originEnd - origin;
+  const proj = new Date(day);
+  proj.setHours(origin.getHours(), origin.getMinutes(), 0, 0);
+  const projEnd = new Date(proj.getTime() + durationMs);
+  return { start: proj.toISOString(), end: projEnd.toISOString() };
 }
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
@@ -446,6 +482,34 @@ const styles = `
   .search-icon svg { width: 15px; height: 15px; stroke: ${T.muted}; stroke-width: 2; fill: none; }
   .search-input { width: 100%; border: 1px solid ${T.border}; border-radius: 8px; padding: 9px 12px 9px 34px; font-family: inherit; font-size: 14px; color: ${T.ink}; background: ${T.white}; outline: none; transition: border-color 0.15s; }
   .search-input:focus { border-color: ${T.teal}; box-shadow: 0 0 0 3px rgba(13,79,79,0.12); }
+
+  /* ── Recurring indicator ── */
+  .recur-badge {
+    display: inline-flex; align-items: center; gap: 3px;
+    font-size: 9px; font-weight: 600; opacity: 0.75; margin-top: 2px;
+  }
+  .recur-icon { display: inline-block; }
+
+  /* ── Recurrence toggle ── */
+  .recur-toggle-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; border: 1px solid ${T.border}; border-radius: 8px;
+    cursor: pointer; transition: all 0.15s; margin-bottom: 16px;
+  }
+  .recur-toggle-row:hover { border-color: ${T.borderMid}; background: ${T.tealFaint}; }
+  .recur-toggle-row.active { border-color: ${T.teal}; background: ${T.tealLight}; }
+  .recur-toggle-label { font-size: 13px; font-weight: 500; color: ${T.ink}; }
+  .recur-toggle-sub   { font-size: 11px; color: ${T.muted}; margin-top: 1px; }
+  .toggle-pill {
+    width: 36px; height: 20px; border-radius: 10px; background: ${T.border};
+    position: relative; transition: background 0.2s; flex-shrink: 0;
+  }
+  .toggle-pill.on { background: ${T.teal}; }
+  .toggle-pill-knob {
+    position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+    border-radius: 50%; background: white; transition: transform 0.2s;
+  }
+  .toggle-pill.on .toggle-pill-knob { transform: translateX(16px); }
 
   @media (max-width: 520px) {
     .header-top { padding: 0 16px; }
@@ -846,13 +910,13 @@ function WeeklyView({ user, circle, approvedMembers, events, onEventClick, onCel
 
     // All events on the selected day, sorted by start time
     const dayEvents = weekEvents
-      .filter(ev => eventOverlapsDay(ev, selectedDay))
+      .filter(ev => eventAppearsOnDay(ev, selectedDay))
       .sort((a, b) => new Date(a.start_time) - new Date(b.start_time));
 
     // Which days have at least one event
     const daysWithEvents = new Set(
       weekEvents.flatMap(ev =>
-        days.filter(d => eventOverlapsDay(ev, d)).map((_, i) => i)
+        days.filter(d => eventAppearsOnDay(ev, d)).map((_, i) => i)
       )
     );
 
@@ -920,8 +984,16 @@ function WeeklyView({ user, circle, approvedMembers, events, onEventClick, onCel
                 >
                   <div className="agenda-event-strip" style={{background: primaryPal.border}} />
                   <div className="agenda-event-body">
-                    <div className="agenda-event-title">{ev.title}</div>
-                    <div className="agenda-event-time">{fmtAgendaTime(ev)}</div>
+                    <div className="agenda-event-title">
+                      {ev.title}
+                      {ev.recurring && <span style={{fontSize:10,fontWeight:500,color:primaryPal.text,opacity:0.7,marginLeft:6}}>&#x21BB; weekly</span>}
+                    </div>
+                    <div className="agenda-event-time">
+                      {ev.recurring
+                        ? (ev.all_day ? "All day" : (() => { const t = projectedTimes(ev, selectedDay); return `${displayTime(t.start)} – ${displayTime(t.end)}`; })())
+                        : fmtAgendaTime(ev)
+                      }
+                    </div>
                     <div className="agenda-event-members">
                       {members.map(({ m, mi }) => {
                         const pal = memberColor(mi);
@@ -992,7 +1064,7 @@ function WeeklyView({ user, circle, approvedMembers, events, onEventClick, onCel
                 const pal = memberColor(mi);
                 const cellEvents = weekEvents.filter(ev => {
                   const memberIds = ev.event_members?.map(em=>em.profile_id)||[];
-                  return memberIds.includes(m.profile.id) && eventOverlapsDay(ev, day);
+                  return memberIds.includes(m.profile.id) && eventAppearsOnDay(ev, day);
                 });
                 return (
                   <div
@@ -1001,8 +1073,10 @@ function WeeklyView({ user, circle, approvedMembers, events, onEventClick, onCel
                     onClick={() => onCellClick({ day, member: m, memberIndex: mi })}
                   >
                     {cellEvents.map(ev => {
-                      const isStart = eventStartsOnDay(ev, day);
-                      const isMultiDay = !isSameDay(new Date(ev.start_time), new Date(ev.end_time));
+                      const times = ev.recurring ? projectedTimes(ev, day) : null;
+                      const displayStart = times ? times.start : ev.start_time;
+                      const isStart = ev.recurring ? true : eventStartsOnDay(ev, day);
+                      const isMultiDay = !ev.recurring && !isSameDay(new Date(ev.start_time), new Date(ev.end_time));
                       return (
                         <div
                           key={ev.id}
@@ -1011,8 +1085,9 @@ function WeeklyView({ user, circle, approvedMembers, events, onEventClick, onCel
                           onClick={e => { e.stopPropagation(); onEventClick(ev); }}
                         >
                           <span className="event-chip-title">{ev.title}</span>
-                          {isStart && !ev.all_day && <span className="event-chip-time">{displayTime(ev.start_time)}</span>}
+                          {isStart && !ev.all_day && <span className="event-chip-time">{displayTime(displayStart)}</span>}
                           {!isStart && isMultiDay && <span className="event-chip-cont">cont'd</span>}
+                          {ev.recurring && <span className="recur-badge" style={{color:pal.text}}>&#x21BB; weekly</span>}
                         </div>
                       );
                     })}
@@ -1029,6 +1104,20 @@ function WeeklyView({ user, circle, approvedMembers, events, onEventClick, onCel
 
 // ─── Event Modal ──────────────────────────────────────────────────────────────
 
+function RecurToggle({ on, onToggle }) {
+  return (
+    <div className={`recur-toggle-row ${on?"active":""}`} onClick={onToggle}>
+      <div>
+        <div className="recur-toggle-label">Repeat weekly</div>
+        <div className="recur-toggle-sub">{on ? "Repeats every week on the same day" : "One-time event"}</div>
+      </div>
+      <div className={`toggle-pill ${on?"on":""}`}>
+        <div className="toggle-pill-knob" />
+      </div>
+    </div>
+  );
+}
+
 function EventModal({ user, circle, members, event, defaultDay, defaultMemberIds, onClose, onSaved, onDeleted }) {
   const isNew = !event;
 
@@ -1036,11 +1125,13 @@ function EventModal({ user, circle, members, event, defaultDay, defaultMemberIds
   defaultStart.setHours(9,0,0,0);
   const defaultEnd = new Date(defaultStart); defaultEnd.setHours(10,0,0,0);
 
-  const [title, setTitle]       = useState(event?.title || "");
-  const [desc, setDesc]         = useState(event?.description || "");
-  const [allDay, setAllDay]     = useState(event?.all_day ?? false);
-  const [startStr, setStartStr] = useState(event ? fmtDateTime(new Date(event.start_time)) : fmtDateTime(defaultStart));
-  const [endStr, setEndStr]     = useState(event ? fmtDateTime(new Date(event.end_time))   : fmtDateTime(defaultEnd));
+  const [title, setTitle]           = useState(event?.title || "");
+  const [desc, setDesc]             = useState(event?.description || "");
+  const [allDay, setAllDay]         = useState(event?.all_day ?? false);
+  const [startStr, setStartStr]     = useState(event ? fmtDateTime(new Date(event.start_time)) : fmtDateTime(defaultStart));
+  const [endStr, setEndStr]         = useState(event ? fmtDateTime(new Date(event.end_time))   : fmtDateTime(defaultEnd));
+  const [recurring, setRecurring]   = useState(event?.recurring ?? false);
+  const [recurEnd, setRecurEnd]     = useState(event?.recurring_end || "");
   const [selMembers, setSelMembers] = useState(() => {
     if (event) return (event.event_members||[]).map(em=>em.profile_id);
     return defaultMemberIds || [];
@@ -1067,6 +1158,8 @@ function EventModal({ user, circle, members, event, defaultDay, defaultMemberIds
       all_day: allDay,
       start_time: allDay ? new Date(fmtDate(startDt)+"T00:00:00").toISOString() : startDt.toISOString(),
       end_time:   allDay ? new Date(fmtDate(endDt  )+"T23:59:59").toISOString() : endDt.toISOString(),
+      recurring,
+      recurring_end: recurring && recurEnd ? recurEnd : null,
     };
 
     let savedEvent;
@@ -1085,7 +1178,10 @@ function EventModal({ user, circle, members, event, defaultDay, defaultMemberIds
   };
 
   const del = async () => {
-    if (!confirm("Delete this event?")) return;
+    const msg2 = event?.recurring
+      ? "Delete this recurring event and all its occurrences?"
+      : "Delete this event?";
+    if (!confirm(msg2)) return;
     setDeleting(true);
     await db.deleteEvent(event.id, user.token);
     onDeleted();
@@ -1122,6 +1218,19 @@ function EventModal({ user, circle, members, event, defaultDay, defaultMemberIds
             <input className="field-input" type={allDay?"date":"datetime-local"} value={allDay?endStr.slice(0,10):endStr} onChange={e=>setEndStr(allDay?e.target.value+"T23:59":e.target.value)}/>
           </div>
         </div>
+
+        <RecurToggle on={recurring} onToggle={() => setRecurring(r => !r)} />
+
+        {recurring && (
+          <div className="field" style={{marginTop:-8}}>
+            <label className="field-label">Repeat until <span style={{textTransform:"none",fontWeight:400,color:T.muted}}>(optional — leave blank to repeat indefinitely)</span></label>
+            <input
+              className="field-input" type="date"
+              value={recurEnd}
+              onChange={e => setRecurEnd(e.target.value)}
+            />
+          </div>
+        )}
 
         <div className="field">
           <label className="field-label">Members</label>
