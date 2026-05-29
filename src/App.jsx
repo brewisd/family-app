@@ -769,10 +769,38 @@ function CreateCircle({ user, onBack, onCreated }) {
   );
 }
 
+// ─── useIsMobile ─────────────────────────────────────────────────────────────
+
+function useIsMobile(breakpoint = 640) {
+  const [isMobile, setIsMobile] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth <= breakpoint : false
+  );
+  useEffect(() => {
+    const mq = window.matchMedia(`(max-width: ${breakpoint}px)`);
+    const handler = (e) => setIsMobile(e.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, [breakpoint]);
+  return isMobile;
+}
+
 // ─── Weekly View ──────────────────────────────────────────────────────────────
 
 function WeeklyView({ user, circle, approvedMembers, events, onEventClick, onCellClick }) {
   const [weekOffset, setWeekOffset] = useState(0);
+  const isMobile = useIsMobile();
+
+  // Default selected day to today if in current week, else first day of week
+  const [selectedDayOffset, setSelectedDayOffset] = useState(() => {
+    const todayMon = getMonday(new Date());
+    const thisMon  = getMonday(new Date());
+    if (isSameDay(todayMon, thisMon)) {
+      const d = new Date().getDay();
+      return d === 0 ? 6 : d - 1; // Mon=0…Sun=6
+    }
+    return 0;
+  });
+
   const monday = getMonday(addDays(new Date(), weekOffset * 7));
   const days = Array.from({ length: 7 }, (_, i) => addDays(monday, i));
 
@@ -780,7 +808,6 @@ function WeeklyView({ user, circle, approvedMembers, events, onEventClick, onCel
   const weekEnd   = addDays(monday, 6);
   weekEnd.setHours(23,59,59,999);
 
-  // Mon name + year in header
   const monthsSpanned = weekStart.getMonth() !== weekEnd.getMonth()
     ? `${MONTH_LABELS[weekStart.getMonth()]} – ${MONTH_LABELS[weekEnd.getMonth()]} ${weekEnd.getFullYear()}`
     : `${MONTH_LABELS[weekStart.getMonth()]} ${weekStart.getFullYear()}`;
@@ -792,21 +819,148 @@ function WeeklyView({ user, circle, approvedMembers, events, onEventClick, onCel
     return evStart <= weekEnd && evEnd >= weekStart;
   });
 
-  // Total columns: 1 day-label col + N member cols
+  // When week changes, snap selected day to today if visible, else day 0
+  useEffect(() => {
+    const todayIdx = days.findIndex(d => isToday(d));
+    setSelectedDayOffset(todayIdx >= 0 ? todayIdx : 0);
+  }, [weekOffset]);
+
+  const goWeek = (dir) => { setWeekOffset(o => o + dir); };
+  const goToday = () => { setWeekOffset(0); };
+
+  // ── Shared toolbar ────────────────────────────────────────────────────────
+  const Toolbar = () => (
+    <div className="week-toolbar">
+      <div className="week-nav">
+        <button className="week-nav-btn" onClick={() => goWeek(-1)} aria-label="Previous week">{Ic.chevronL}</button>
+        <span className="week-label">{monthsSpanned}</span>
+        <button className="week-nav-btn" onClick={() => goWeek(1)} aria-label="Next week">{Ic.chevronR}</button>
+      </div>
+      <button className="week-today-btn" onClick={goToday}>Today</button>
+    </div>
+  );
+
+  // ── Mobile: agenda list ───────────────────────────────────────────────────
+  if (isMobile) {
+    const selectedDay = days[selectedDayOffset];
+
+    // All events on the selected day, sorted by start time
+    const dayEvents = weekEvents
+      .filter(ev => eventOverlapsDay(ev, selectedDay))
+      .sort((a, b) => new Date(a.start_time) - new Date(b.start_time));
+
+    // Which days have at least one event
+    const daysWithEvents = new Set(
+      weekEvents.flatMap(ev =>
+        days.filter(d => eventOverlapsDay(ev, d)).map((_, i) => i)
+      )
+    );
+
+    const fmtAgendaTime = (ev) => {
+      if (ev.all_day) return "All day";
+      const s = displayTime(ev.start_time);
+      const e = displayTime(ev.end_time);
+      return `${s} – ${e}`;
+    };
+
+    // Members involved in an event
+    const eventMemberDetails = (ev) => {
+      const pids = (ev.event_members || []).map(em => em.profile_id);
+      return approvedMembers
+        .map((m, mi) => ({ m, mi, pid: m.profile?.id }))
+        .filter(({ pid }) => pids.includes(pid));
+    };
+
+    const fmtLongDate = (d) => {
+      const days2 = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+      const months2 = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+      return `${days2[d.getDay()]} ${d.getDate()} ${months2[d.getMonth()]}`;
+    };
+
+    return (
+      <div style={{display:"flex",flexDirection:"column",flex:1,overflow:"hidden"}}>
+        <Toolbar />
+
+        {/* Day pill strip */}
+        <div className="agenda-day-strip">
+          {days.map((day, di) => (
+            <button
+              key={di}
+              className={[
+                "agenda-day-btn",
+                di === selectedDayOffset ? "selected" : "",
+                isToday(day) ? "is-today" : "",
+                daysWithEvents.has(di) ? "has-events" : "",
+              ].filter(Boolean).join(" ")}
+              onClick={() => setSelectedDayOffset(di)}
+            >
+              <span className="agenda-day-num">{day.getDate()}</span>
+              <span className="agenda-day-lbl">{DAY_LABELS[di].slice(0,1)}</span>
+              <span className="agenda-dot" />
+            </button>
+          ))}
+        </div>
+
+        {/* Event list for selected day */}
+        <div className="agenda-body">
+          <div className="agenda-date-heading">{fmtLongDate(selectedDay)}</div>
+
+          {dayEvents.length === 0 ? (
+            <div className="agenda-empty">Nothing on this day</div>
+          ) : (
+            dayEvents.map(ev => {
+              const members = eventMemberDetails(ev);
+              // Use the colour of the first associated member, or a neutral fallback
+              const primaryPal = members.length > 0 ? memberColor(members[0].mi) : { border: T.border, bg: T.tealLight, text: T.teal };
+              return (
+                <div
+                  key={ev.id}
+                  className="agenda-event-card"
+                  onClick={() => onEventClick(ev)}
+                >
+                  <div className="agenda-event-strip" style={{background: primaryPal.border}} />
+                  <div className="agenda-event-body">
+                    <div className="agenda-event-title">{ev.title}</div>
+                    <div className="agenda-event-time">{fmtAgendaTime(ev)}</div>
+                    <div className="agenda-event-members">
+                      {members.map(({ m, mi }) => {
+                        const pal = memberColor(mi);
+                        return (
+                          <div
+                            key={m.id}
+                            className="agenda-member-av"
+                            style={{background: pal.border, color: pal.text}}
+                            title={m.profile?.full_name}
+                          >
+                            {initials(m.profile?.full_name || "?")}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              );
+            })
+          )}
+
+          <button
+            className="agenda-add-btn"
+            onClick={() => onCellClick({ day: selectedDay, member: approvedMembers[0], memberIndex: 0 })}
+          >
+            + Add event
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Desktop: full grid ────────────────────────────────────────────────────
   const cols = approvedMembers.length;
   const gridCols = `80px repeat(${cols}, minmax(90px, 1fr))`;
 
   return (
     <div style={{display:"flex",flexDirection:"column",flex:1,overflow:"hidden"}}>
-      {/* Toolbar */}
-      <div className="week-toolbar">
-        <div className="week-nav">
-          <button className="week-nav-btn" onClick={()=>setWeekOffset(o=>o-1)} aria-label="Previous week">{Ic.chevronL}</button>
-          <span className="week-label">{monthsSpanned}</span>
-          <button className="week-nav-btn" onClick={()=>setWeekOffset(o=>o+1)} aria-label="Next week">{Ic.chevronR}</button>
-        </div>
-        <button className="week-today-btn" onClick={()=>setWeekOffset(0)}>Today</button>
-      </div>
+      <Toolbar />
 
       {/* Grid */}
       <div className="week-grid-wrap">
@@ -836,7 +990,6 @@ function WeeklyView({ user, circle, approvedMembers, events, onEventClick, onCel
               // Member cells
               ...approvedMembers.map((m, mi) => {
                 const pal = memberColor(mi);
-                // Events for this member on this day
                 const cellEvents = weekEvents.filter(ev => {
                   const memberIds = ev.event_members?.map(em=>em.profile_id)||[];
                   return memberIds.includes(m.profile.id) && eventOverlapsDay(ev, day);
